@@ -1,4 +1,4 @@
-module gopnik
+module github.com/syth0le/gopnik
 
 go 1.21.3
 
