@@ -14,19 +14,25 @@ type Closer struct {
 	once  sync.Once
 	done  chan struct{}
 
+	logger *zap.Logger
+
 	gracefulCloseTimeout  time.Duration
-	logger                *zap.Logger
 	gracefulShutdownFuncs []func() error
+
+	forceCloseTimeout  time.Duration
+	forceShutdownFuncs []func() error
 }
 
-func NewCloser(logger *zap.Logger, gracefulCloseTimeout time.Duration, signals ...os.Signal) *Closer {
+func NewCloser(logger *zap.Logger, gracefulCloseTimeout, forceCloseTimeout time.Duration, signals ...os.Signal) *Closer {
 	closer := &Closer{
 		mutex:                 sync.Mutex{},
 		once:                  sync.Once{},
 		done:                  make(chan struct{}),
-		gracefulCloseTimeout:  gracefulCloseTimeout,
 		logger:                logger,
+		gracefulCloseTimeout:  gracefulCloseTimeout,
 		gracefulShutdownFuncs: nil,
+		forceCloseTimeout:     forceCloseTimeout,
+		forceShutdownFuncs:    nil,
 	}
 
 	if len(signals) > 0 {
@@ -58,6 +64,12 @@ func (c *Closer) Add(f ...func() error) {
 	c.mutex.Unlock()
 }
 
+func (c *Closer) AddForce(f ...func() error) {
+	c.mutex.Lock()
+	c.forceShutdownFuncs = append(c.forceShutdownFuncs, f...)
+	c.mutex.Unlock()
+}
+
 func (c *Closer) Wait() {
 	<-c.done
 }
@@ -66,41 +78,49 @@ func (c *Closer) CloseEverything() {
 	c.once.Do(func() {
 		defer close(c.done)
 
-		c.logger.Info("started graceful shutdowns")
-		if ok := c.waitAllCloseFunctions(); !ok {
-			c.logger.Error("graceful shutdown error: timeout limit exceed")
-		}
+		c.logger.Info("started shutdowns")
+		c.waitAllCloseFunctions()
 	})
 }
 
-func (c *Closer) waitAllCloseFunctions() bool {
+func (c *Closer) waitAllCloseFunctions() {
 	c.mutex.Lock()
 	gracefulFuncs := c.gracefulShutdownFuncs
+	forceFuncs := c.forceShutdownFuncs
 	c.mutex.Unlock()
 
-	wg := &sync.WaitGroup{}
-	for _, f := range gracefulFuncs {
-		wg.Add(1)
-		go func(f func() error) {
-			if err := f(); err != nil {
-				c.logger.Sugar().Errorf("close funcion error: %v", err)
-			}
-			wg.Done()
-		}(f)
+	waitFunc := func(funcs []func() error, timeout time.Duration) bool {
+		wg := &sync.WaitGroup{}
+		for _, f := range funcs {
+			wg.Add(1)
+			go func(f func() error) {
+				if err := f(); err != nil {
+					c.logger.Sugar().Errorf("close funcion error: %v", err)
+				}
+				wg.Done()
+			}(f)
+		}
+
+		ch := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(ch)
+		}()
+		timer := time.NewTimer(c.gracefulCloseTimeout)
+		defer timer.Stop()
+
+		select {
+		case <-ch:
+			return true
+		case <-timer.C:
+			return false
+		}
 	}
 
-	ch := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-	timer := time.NewTimer(c.gracefulCloseTimeout)
-	defer timer.Stop()
-
-	select {
-	case <-ch:
-		return true
-	case <-timer.C:
-		return false
+	if ok := waitFunc(gracefulFuncs, c.gracefulCloseTimeout); !ok {
+		c.logger.Error("graceful shutdown error: timeout limit exceed")
+		if ok := waitFunc(forceFuncs, c.forceCloseTimeout); !ok {
+			c.logger.Error("force shutdown error: timeout limit exceed")
+		}
 	}
 }
