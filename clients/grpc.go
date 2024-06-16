@@ -7,6 +7,7 @@ import (
 
 	retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding/gzip"
 )
 
@@ -67,6 +68,7 @@ func NewGRPCClientConn(ctx context.Context, cfg GRPCClientConnConfig, opts ...GR
 				retry.WithPerRetryTimeout(cfg.TimeoutBetweenRetries),
 			),
 		),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	}
 
 	if cfg.EnableCompressor {
